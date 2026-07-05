@@ -288,6 +288,9 @@ class PolicyValueNet(nn.Module):
         with torch.no_grad():
             if state_tensor.dim() == 3:
                 state_tensor = state_tensor.unsqueeze(0)  # 添加 batch 维度
+            # 将输入张量搬到网络参数所在设备（CPU→GPU）
+            device = next(self.parameters()).device
+            state_tensor = state_tensor.to(device)
             logits, value = self.forward(state_tensor)
             probs = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()
             val = value.item()
