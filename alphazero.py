@@ -28,6 +28,8 @@ from __future__ import annotations
 import math
 import os
 import random
+import multiprocessing as mp
+import time
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -649,6 +651,82 @@ def play_one_game(net: PolicyValueNet, config: SelfPlayConfig | None = None
         step += 1
 
 
+# ---- 并行自我对弈 Worker ----
+
+# 全局变量：在 worker 进程中持有网络实例，避免每次 pickle 传输
+_worker_net: PolicyValueNet | None = None
+_worker_config: SelfPlayConfig | None = None
+
+
+def _worker_init(net_state_dict: dict, num_channels: int, num_res_blocks: int,
+                 config: SelfPlayConfig):
+    """
+    多进程 worker 初始化：在子进程中创建 CPU 网络并加载权重。
+    每个子进程只调用一次，避免重复创建网络。
+    """
+    global _worker_net, _worker_config
+    _worker_net = PolicyValueNet(num_channels=num_channels, num_res_blocks=num_res_blocks)
+    _worker_net.load_state_dict(net_state_dict)
+    _worker_net.eval()
+    _worker_config = config
+
+
+def _worker_play_game(seed: int) -> list[tuple]:
+    """
+    多进程 worker：使用全局网络实例运行一局自我对弈。
+    返回增强后的训练数据列表。
+    """
+    global _worker_net, _worker_config
+    # 为每个 worker 设置独立的随机种子，确保对局多样性
+    random.seed(seed)
+    np.random.seed(seed)
+    # 注意：由于 MCTS 树搜索和 NN 推理都在 CPU 上，
+    # 子进程不需要 CUDA，使用 CPU tensor 即可
+    return play_one_game(_worker_net, _worker_config)
+
+
+def _run_parallel_selfplay(net: PolicyValueNet, config: SelfPlayConfig,
+                           num_games: int, num_workers: int,
+                           num_channels: int, num_res_blocks: int
+                           ) -> list[list[tuple]]:
+    """
+    使用多进程并行运行 self-play 对局。
+
+    策略：将网络权重发送到 N 个子进程，每个子进程在 CPU 上独立运行
+    MCTS + NN 推理。因为 8×8 棋盘的 NN 推理极快（~0.3ms），CPU 多核并行
+    的总吞吐量远超单 GPU 串行调用。
+
+    返回: 每局游戏的增强数据列表
+    """
+    if num_workers <= 1 or num_games <= 1:
+        # 单进程模式：直接在主进程运行
+        results = []
+        for i in range(num_games):
+            seed = random.randint(0, 2 ** 31 - 1)
+            random.seed(seed)
+            np.random.seed(seed)
+            results.append(play_one_game(net, config))
+        return results
+
+    # 获取 CPU 上的网络权重（子进程在 CPU 上运行，避免 CUDA 共享问题）
+    net_state_dict = {k: v.cpu().clone() for k, v in net.state_dict().items()}
+
+    # 为每局游戏生成独立种子
+    seeds = [random.randint(0, 2 ** 31 - 1) for _ in range(num_games)]
+
+    # 使用 spawn 上下文确保每个子进程有独立的 Python 解释器
+    # fork 模式可能导致 CUDA 状态损坏
+    ctx = mp.get_context('spawn')
+    with ctx.Pool(
+        processes=min(num_workers, num_games),
+        initializer=_worker_init,
+        initargs=(net_state_dict, num_channels, num_res_blocks, config),
+    ) as pool:
+        results = pool.map(_worker_play_game, seeds)
+
+    return results
+
+
 # ==============================================================================
 #  4. 训练器 (Trainer)
 # ==============================================================================
@@ -801,6 +879,10 @@ def main():
                         help='残差块数量（GPU 推荐 4，CPU 推荐 2）')
     parser.add_argument('--no-amp', action='store_true',
                         help='禁用 AMP 混合精度训练')
+    parser.add_argument('--num-workers', type=int, default=0,
+                        help='并行 self-play 进程数（0=自动检测 CPU 核心数）')
+    parser.add_argument('--no-compile', action='store_true',
+                        help='禁用 torch.compile 加速')
     args = parser.parse_args()
 
     # ---- 设置随机种子 ----
@@ -816,7 +898,12 @@ def main():
 
     use_amp = (device.type == 'cuda') and (not args.no_amp)
 
-    # ---- 打印 GPU 信息 ----
+    # 自动检测 worker 数量
+    num_workers = args.num_workers
+    if num_workers == 0:
+        num_workers = max(1, (os.cpu_count() or 4) - 1)  # 留一个核给主进程
+
+    # ---- 打印系统信息 ----
     print('=' * 60)
     print('  系统信息')
     print('=' * 60)
@@ -829,6 +916,7 @@ def main():
         print(f'  AMP 混合精度: {"启用" if use_amp else "禁用"}')
     else:
         print(f'  AMP 混合精度: 不可用（需要 CUDA）')
+    print(f'  Self-play Workers: {num_workers}')
     print(f'  网络通道数:   {args.num_channels}')
     print(f'  残差块数:     {args.num_res_blocks}')
     print(f'  随机种子:     {args.seed}')
@@ -840,6 +928,22 @@ def main():
         num_channels=args.num_channels,
         num_res_blocks=args.num_res_blocks,
     ).to(device)
+
+    # torch.compile 编译网络：首次调用时花几秒编译，之后推理速度提升 2-3×
+    # 对于 MCTS 中数千次的单样本 forward，编译收益巨大
+    if hasattr(torch, 'compile') and (not args.no_compile):
+        try:
+            print('  正在编译网络 (torch.compile)...', end=' ', flush=True)
+            t0 = time.perf_counter()
+            net = torch.compile(net, mode='reduce-overhead')
+            # 预热：运行一次虚拟 forward 触发编译
+            dummy = torch.zeros(1, 3, 8, 8, device=device)
+            net(dummy)
+            elapsed = time.perf_counter() - t0
+            print(f'完成 ({elapsed:.1f}s)')
+        except Exception as e:
+            print(f'编译失败 ({e})，回退到普通模式')
+
     optimizer = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.l2_weight)
     # 使用 AdamW 的内置 weight_decay 替代手动 L2，效率更高
 
@@ -871,16 +975,20 @@ def main():
     for iteration in range(start_iteration, start_iteration + args.iterations):
         print(f'--- 第 {iteration + 1} 轮 / {start_iteration + args.iterations} ---')
 
-        # ---- 第一阶段：自我对弈 ----
-        print(f'  自我对弈 ({args.selfplay_games} 局)...')
+        # ---- 第一阶段：并行自我对弈 ----
+        print(f'  自我对弈 ({args.selfplay_games} 局, {num_workers} workers)...')
+        t0 = time.perf_counter()
+        all_game_data = _run_parallel_selfplay(
+            net, selfplay_config, args.selfplay_games, num_workers,
+            args.num_channels, args.num_res_blocks,
+        )
         total_new_data = 0
-        for game_idx in range(args.selfplay_games):
-            game_data = play_one_game(net, selfplay_config)
+        for game_data in all_game_data:
             buffer.add(game_data)
             total_new_data += len(game_data)
-            if (game_idx + 1) % 10 == 0 or game_idx == 0:
-                print(f'    已完成 {game_idx + 1}/{args.selfplay_games} 局, '
-                      f'缓冲区大小: {len(buffer):,}')
+        elapsed = time.perf_counter() - t0
+        print(f'  完成！用时 {elapsed:.1f}s, 新增 {total_new_data:,} 条数据, '
+              f'缓冲区: {len(buffer):,} 条')
 
         # ---- 第二阶段：训练 ----
         print(f'  训练 ({args.epochs} epochs)...')
