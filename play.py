@@ -107,10 +107,10 @@ HTML = r"""<!DOCTYPE html>
 </div>
 
 <script>
-const ROWS=15, COLS=15;
-// 星位
-const STARS=new Set([3,7,11].flatMap(r=>[3,7,11].map(c=>r*COLS+c)));
-let board=[]; // 15x15, 0=空 1=人 2=AI
+const ROWS=8, COLS=8;
+// 星位（8×8 棋盘无标准星位，设为空）
+const STARS=new Set();
+let board=[]; // 8x8, 0=空 1=人 2=AI
 let processing=false; // AI 思考中禁止点击
 let generation=0;    // 用来忽略过时的响应
 let gameOver=false;

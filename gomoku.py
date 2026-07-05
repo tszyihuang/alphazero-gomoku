@@ -1,5 +1,5 @@
 """
-五子棋 Gymnasium 环境 (15×15)
+五子棋 Gymnasium 环境 (8×8)
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ class GomokuEnv(gym.Env):
 
     metadata = {"render_modes": ["human", "ansi"], "render_fps": 1}
 
-    ROWS = 15
-    COLS = 15
+    ROWS = 8
+    COLS = 8
     CONNECT = 5
 
     EMPTY = 0

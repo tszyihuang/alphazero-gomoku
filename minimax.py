@@ -1,5 +1,5 @@
 """
-Minimax 剪枝搜索策略，用于 15×15 五子棋（自由落子规则）。
+Minimax 剪枝搜索策略，用于 8×8 五子棋（自由落子规则）。
 
 优化点：
   - 候选落子过滤：只在已有棋子附近搜索（曼哈顿距离 ≤ 2）
@@ -15,7 +15,7 @@ from gomoku import GomokuEnv, check_winner_from
 
 # ---------- 棋盘与方向常量 ----------
 
-N_CELLS = GomokuEnv.ROWS * GomokuEnv.COLS          # 棋盘格子总数（15×15 = 225）
+N_CELLS = GomokuEnv.ROWS * GomokuEnv.COLS          # 棋盘格子总数（8×8 = 64）
 _DIRECTIONS = [(0, 1), (1, 0), (1, 1), (1, -1)]    # 四个搜索方向：水平、垂直、主对角线、副对角线
 
 # 预计算每个格子的行 / 列索引，加速一维索引 → 二维坐标转换
@@ -301,13 +301,13 @@ class MinimaxPlayer:
         """无状态 AI，无需重置。"""
         pass
 
-    def predict_first(self, obs450):
+    def predict_first(self, obs128):
         """
         处理首次观测，返回先手落子。
-        obs450 是长度为 450 的扁平数组（15×15×2），取前 225 个值解码棋盘。
+        obs128 是长度为 128 的扁平数组（8×8×2），取前 64 个值解码棋盘。
         """
         n_cells = GomokuEnv.ROWS * GomokuEnv.COLS
-        board = (obs450[:n_cells] * 2.0).astype(np.int8).reshape(GomokuEnv.ROWS, GomokuEnv.COLS)
+        board = (obs128[:n_cells] * 2.0).astype(np.int8).reshape(GomokuEnv.ROWS, GomokuEnv.COLS)
         return self._search(board, GomokuEnv.PLAYER_1)
 
     def opponent_callback(self, board, player):

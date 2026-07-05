@@ -1,5 +1,5 @@
 """
-MCTS (Monte Carlo Tree Search) 策略，用于 15×15 五子棋。
+MCTS (Monte Carlo Tree Search) 策略，用于 8×8 五子棋。
 
 纯启发式叶节点评估 + MCTS 树搜索。用 minimax 评估函数代替随机 rollout，
 以极快的速度（数千迭代/秒）搜索更深层战术威胁。
