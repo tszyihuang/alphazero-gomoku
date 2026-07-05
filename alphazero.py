@@ -709,7 +709,12 @@ def _run_parallel_selfplay(net: PolicyValueNet, config: SelfPlayConfig,
         return results
 
     # 获取 CPU 上的网络权重（子进程在 CPU 上运行，避免 CUDA 共享问题）
-    net_state_dict = {k: v.cpu().clone() for k, v in net.state_dict().items()}
+    raw_state_dict = {k: v.cpu().clone() for k, v in net.state_dict().items()}
+    # 移除 torch.compile 添加的 _orig_mod. 前缀，因为 worker 创建的是未编译网络
+    net_state_dict = {}
+    for k, v in raw_state_dict.items():
+        clean_key = k.replace('_orig_mod.', '')
+        net_state_dict[clean_key] = v
 
     # 为每局游戏生成独立种子
     seeds = [random.randint(0, 2 ** 31 - 1) for _ in range(num_games)]
@@ -808,14 +813,22 @@ def compute_loss(
     }
 
 
+def _unwrap_state_dict(state_dict: dict) -> dict:
+    """移除 torch.compile 添加的 _orig_mod. 前缀，得到干净的参数名。"""
+    clean = {}
+    for k, v in state_dict.items():
+        clean[k.replace('_orig_mod.', '')] = v
+    return clean
+
+
 def save_checkpoint(net: PolicyValueNet, optimizer: torch.optim.Optimizer,
                     iteration: int, save_dir: str = 'checkpoints'):
-    """保存模型检查点。"""
+    """保存模型检查点（始终保存干净参数名，不受 torch.compile 影响）。"""
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, f'alphazero_iter_{iteration:04d}.pth')
     torch.save({
         'iteration': iteration,
-        'model_state_dict': net.state_dict(),
+        'model_state_dict': _unwrap_state_dict(net.state_dict()),
         'optimizer_state_dict': optimizer.state_dict(),
     }, path)
     print(f'  [Checkpoint] 已保存: {path}')
@@ -823,10 +836,15 @@ def save_checkpoint(net: PolicyValueNet, optimizer: torch.optim.Optimizer,
 
 def load_checkpoint(net: PolicyValueNet, optimizer: torch.optim.Optimizer | None,
                     iteration: int, save_dir: str = 'checkpoints') -> int:
-    """加载模型检查点。返回加载的迭代数。"""
+    """加载模型检查点。返回加载的迭代数。兼容编译/未编译网络。"""
     path = os.path.join(save_dir, f'alphazero_iter_{iteration:04d}.pth')
     checkpoint = torch.load(path, map_location='cpu', weights_only=False)
-    net.load_state_dict(checkpoint['model_state_dict'])
+    # 加载时也做一次 unwrap，以兼容各种保存格式
+    saved_sd = _unwrap_state_dict(checkpoint['model_state_dict'])
+    current_sd = _unwrap_state_dict(net.state_dict())
+    # 只加载存在的 key（兼容不同网络结构）
+    filtered_sd = {k: v for k, v in saved_sd.items() if k in current_sd}
+    net.load_state_dict(filtered_sd, strict=False)
     if optimizer is not None:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     print(f'  [Checkpoint] 已加载: {path}')
