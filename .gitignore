@@ -4,3 +4,6 @@ __pycache__/
 
 # 忽略 VS Code 的本地设置文件夹
 .vscode/
+
+# 忽略模型检查点文件
+checkpoints/
